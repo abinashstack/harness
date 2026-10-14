@@ -1,8 +1,6 @@
 // Package provider abstracts model backends behind one message model. An
 // Anthropic-wire and an OpenAI-wire adapter cover api.anthropic.com,
-// api.openai.com, any OpenAI-compatible base_url (Ollama, vLLM), and the
-// omp-aicore localhost proxy — the last is just a base_url plus a model-name
-// map, exercising the exact same adapter code as the direct path.
+// api.openai.com, and any OpenAI-compatible base_url (Ollama, vLLM).
 //
 // The unified model is deliberately small: a Message is a Role plus a list of
 // Parts, and a Part is text, a tool call, or a tool result. Each wire adapter
@@ -214,10 +212,10 @@ func (p Pricing) Cost(u Usage) float64 {
 		m(u.CacheWriteTokens, p.CacheWritePerMTok)
 }
 
-// Config describes one backend. omp-aicore, the canonical hosts, and a local
-// Ollama differ only in these fields — never in code path.
+// Config describes one backend. The canonical hosts and a local Ollama differ
+// only in these fields — never in code path.
 type Config struct {
-	Name      string            // "omp-aicore" | "anthropic" | "openai" | "ollama"
+	Name      string            // "anthropic" | "openai" | "ollama"
 	Wire      Wire              // anthropic | openai
 	BaseURL   string            // "" => canonical host for the wire
 	APIKeyEnv string            // env var holding the key; "" allowed for localhost

@@ -14,8 +14,8 @@ type sseFrame struct {
 }
 
 // sseScanner reads text/event-stream frames from r. It tolerates streams that
-// omit the "event:" line (AI Core's Bedrock-shaped Anthropic stream does this,
-// which is why omp-aicore re-injects them) — event is simply "" then.
+// omit the "event:" line (some Bedrock-shaped Anthropic streams do this) —
+// event is simply "" then.
 type sseScanner struct {
 	sc      *bufio.Scanner
 	event   string
