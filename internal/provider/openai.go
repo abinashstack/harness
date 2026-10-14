@@ -4,6 +4,8 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"io"
+	"strings"
 )
 
 const openaiDefaultBase = "https://api.openai.com"
@@ -42,6 +44,21 @@ type oRequest struct {
 	Tools       []oTool    `json:"tools,omitempty"`
 	MaxTokens   int        `json:"max_tokens,omitempty"`
 	Temperature *float64   `json:"temperature,omitempty"`
+
+	Stream        bool            `json:"stream,omitempty"`
+	StreamOptions *oStreamOptions `json:"stream_options,omitempty"`
+}
+
+type oStreamOptions struct {
+	IncludeUsage bool `json:"include_usage"`
+}
+
+type oUsage struct {
+	PromptTokens     int `json:"prompt_tokens"`
+	CompletionTokens int `json:"completion_tokens"`
+	Details          struct {
+		CachedTokens int `json:"cached_tokens"`
+	} `json:"prompt_tokens_details"`
 }
 
 type oResponse struct {
@@ -49,25 +66,39 @@ type oResponse struct {
 		Message      oMessage `json:"message"`
 		FinishReason string   `json:"finish_reason"`
 	} `json:"choices"`
-	Usage struct {
-		PromptTokens     int `json:"prompt_tokens"`
-		CompletionTokens int `json:"completion_tokens"`
-		Details          struct {
-			CachedTokens int `json:"cached_tokens"`
-		} `json:"prompt_tokens_details"`
-	} `json:"usage"`
+	Usage oUsage `json:"usage"`
+}
+
+// oChunk is one streamed chat.completion.chunk. The final chunk carries Usage
+// and no choices.
+type oChunk struct {
+	Choices []struct {
+		Delta struct {
+			Content   string `json:"content"`
+			ToolCalls []struct {
+				Index    int    `json:"index"`
+				ID       string `json:"id"`
+				Function struct {
+					Name      string `json:"name"`
+					Arguments string `json:"arguments"`
+				} `json:"function"`
+			} `json:"tool_calls"`
+		} `json:"delta"`
+		FinishReason string `json:"finish_reason"`
+	} `json:"choices"`
+	Usage *oUsage `json:"usage"`
+	Error *struct {
+		Message string `json:"message"`
+	} `json:"error"`
 }
 
 func strp(s string) *string { return &s }
 
-func (o *openai) Stream(ctx context.Context, req Request) (Stream, error) {
-	return streamViaChat(ctx, o, req)
-}
-
-func (o *openai) Chat(ctx context.Context, req Request) (Response, error) {
+// prepare translates req into the wire body and request headers.
+func (o *openai) prepare(req Request) (oRequest, map[string]string, error) {
 	key, err := o.apiKey()
 	if err != nil {
-		return Response{}, err
+		return oRequest{}, nil, err
 	}
 	body := oRequest{
 		Model:       o.cfg.resolveModel(req.Model),
@@ -116,6 +147,34 @@ func (o *openai) Chat(ctx context.Context, req Request) (Response, error) {
 	if key != "" {
 		headers["Authorization"] = "Bearer " + key
 	}
+	return body, headers, nil
+}
+
+func openaiStop(s string) StopReason {
+	switch s {
+	case "stop":
+		return StopEndTurn
+	case "tool_calls":
+		return StopToolUse
+	case "length":
+		return StopMaxTokens
+	case "content_filter":
+		return StopRefusal
+	}
+	return StopOther
+}
+
+func (o *openai) usage(u oUsage) Usage {
+	out := Usage{InputTokens: u.PromptTokens, OutputTokens: u.CompletionTokens, CacheReadTokens: u.Details.CachedTokens}
+	out.CostUSD = o.cfg.Pricing.Cost(out)
+	return out
+}
+
+func (o *openai) Chat(ctx context.Context, req Request) (Response, error) {
+	body, headers, err := o.prepare(req)
+	if err != nil {
+		return Response{}, err
+	}
 	raw, err := o.post(ctx, o.baseURL(openaiDefaultBase)+"/v1/chat/completions", headers, body)
 	if err != nil {
 		return Response{}, err
@@ -129,7 +188,7 @@ func (o *openai) Chat(ctx context.Context, req Request) (Response, error) {
 	}
 
 	ch := or.Choices[0]
-	out := Response{Assistant: Message{Role: RoleAssistant}, Raw: raw}
+	out := Response{Assistant: Message{Role: RoleAssistant}, Raw: raw, StopReason: openaiStop(ch.FinishReason), Usage: o.usage(or.Usage)}
 	if ch.Message.Content != nil && *ch.Message.Content != "" {
 		out.Assistant.Content = append(out.Assistant.Content, Text(*ch.Message.Content))
 	}
@@ -138,23 +197,100 @@ func (o *openai) Chat(ctx context.Context, req Request) (Response, error) {
 			ID: tc.ID, Name: tc.Function.Name, Input: json.RawMessage(tc.Function.Arguments),
 		}})
 	}
-	switch ch.FinishReason {
-	case "stop":
-		out.StopReason = StopEndTurn
-	case "tool_calls":
-		out.StopReason = StopToolUse
-	case "length":
-		out.StopReason = StopMaxTokens
-	case "content_filter":
-		out.StopReason = StopRefusal
-	default:
-		out.StopReason = StopOther
-	}
-	out.Usage = Usage{
-		InputTokens:     or.Usage.PromptTokens,
-		OutputTokens:    or.Usage.CompletionTokens,
-		CacheReadTokens: or.Usage.Details.CachedTokens,
-	}
-	out.Usage.CostUSD = o.cfg.Pricing.Cost(out.Usage)
 	return out, nil
+}
+
+// oAcc accumulates one streamed tool call, keyed by its delta index.
+type oAcc struct {
+	id, name string
+	args     strings.Builder
+}
+
+func (o *openai) Stream(ctx context.Context, req Request) (Stream, error) {
+	body, headers, err := o.prepare(req)
+	if err != nil {
+		return nil, err
+	}
+	body.Stream = true
+	body.StreamOptions = &oStreamOptions{IncludeUsage: true}
+	resp, err := o.open(ctx, o.baseURL(openaiDefaultBase)+"/v1/chat/completions", headers, body)
+	if err != nil {
+		return nil, err
+	}
+
+	var (
+		text   strings.Builder
+		calls  = map[int]*oAcc{}
+		order  []int
+		finish string
+		usage  oUsage
+	)
+	toolCalls := func() []ToolCall {
+		var out []ToolCall
+		for _, i := range order {
+			c := calls[i]
+			out = append(out, ToolCall{ID: c.id, Name: c.name, Input: objectOrEmpty(json.RawMessage(c.args.String()))})
+		}
+		return out
+	}
+	handle := func(f sseFrame) ([]Chunk, error) {
+		if string(f.data) == "[DONE]" {
+			// Tool calls are only complete now, so announce them before Done.
+			var cs []Chunk
+			for _, tc := range toolCalls() {
+				tc := tc
+				cs = append(cs, Chunk{ToolCallDelta: &tc})
+			}
+			return cs, io.EOF
+		}
+		var ck oChunk
+		if err := json.Unmarshal(f.data, &ck); err != nil {
+			return nil, fmt.Errorf("provider %q: bad stream event: %w", o.cfg.Name, err)
+		}
+		if ck.Error != nil {
+			return nil, fmt.Errorf("provider %q: stream error: %s", o.cfg.Name, ck.Error.Message)
+		}
+		if ck.Usage != nil {
+			usage = *ck.Usage
+		}
+		if len(ck.Choices) == 0 {
+			return nil, nil
+		}
+		ch := ck.Choices[0]
+		if ch.FinishReason != "" {
+			finish = ch.FinishReason
+		}
+		for _, d := range ch.Delta.ToolCalls {
+			acc := calls[d.Index]
+			if acc == nil {
+				acc = &oAcc{}
+				calls[d.Index] = acc
+				order = append(order, d.Index)
+			}
+			if d.ID != "" {
+				acc.id = d.ID
+			}
+			if d.Function.Name != "" {
+				acc.name = d.Function.Name
+			}
+			acc.args.WriteString(d.Function.Arguments)
+		}
+		if ch.Delta.Content != "" {
+			text.WriteString(ch.Delta.Content)
+			return []Chunk{{TextDelta: ch.Delta.Content}}, nil
+		}
+		return nil, nil
+	}
+	done := func() Response {
+		out := Response{Assistant: Message{Role: RoleAssistant}, StopReason: openaiStop(finish), Usage: o.usage(usage)}
+		if text.Len() > 0 {
+			out.Assistant.Content = append(out.Assistant.Content, Text(text.String()))
+		}
+		for _, tc := range toolCalls() {
+			tc := tc
+			out.Assistant.Content = append(out.Assistant.Content, Part{Type: PartToolUse, ToolCall: &tc})
+		}
+		return out
+	}
+	return newSSEStream(resp.Body, handle, done), nil
 }

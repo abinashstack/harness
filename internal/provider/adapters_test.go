@@ -131,3 +131,97 @@ func TestHTTPErrorAndMissingKey(t *testing.T) {
 		t.Error("want missing-key error")
 	}
 }
+
+// drain reads a stream to EOF, returning the text deltas, tool-call deltas and
+// the terminal Response.
+func drain(t *testing.T, s Stream) (text string, calls []ToolCall, done *Response) {
+	t.Helper()
+	defer s.Close()
+	for {
+		c, err := s.Recv()
+		if err == io.EOF {
+			return
+		}
+		if err != nil {
+			t.Fatal(err)
+		}
+		text += c.TextDelta
+		if c.ToolCallDelta != nil {
+			calls = append(calls, *c.ToolCallDelta)
+		}
+		if c.Done != nil {
+			done = c.Done
+		}
+	}
+}
+
+func TestAnthropicStream(t *testing.T) {
+	var got map[string]any
+	var hdr http.Header
+	var path string
+	// Frames deliberately omit "event:" lines, as some proxies do.
+	srv := serve(t, "data: {\"type\":\"message_start\",\"message\":{\"usage\":{\"input_tokens\":10}}}\n\n"+
+		"data: {\"type\":\"content_block_start\",\"index\":0,\"content_block\":{\"type\":\"text\"}}\n\n"+
+		"data: {\"type\":\"content_block_delta\",\"index\":0,\"delta\":{\"type\":\"text_delta\",\"text\":\"Hel\"}}\n\n"+
+		"data: {\"type\":\"content_block_delta\",\"index\":0,\"delta\":{\"type\":\"text_delta\",\"text\":\"lo\"}}\n\n"+
+		"data: {\"type\":\"content_block_stop\",\"index\":0}\n\n"+
+		"data: {\"type\":\"content_block_start\",\"index\":1,\"content_block\":{\"type\":\"tool_use\",\"id\":\"c9\",\"name\":\"weather\",\"input\":{}}}\n\n"+
+		"data: {\"type\":\"content_block_delta\",\"index\":1,\"delta\":{\"type\":\"input_json_delta\",\"partial_json\":\"{\\\"city\\\":\"}}\n\n"+
+		"data: {\"type\":\"content_block_delta\",\"index\":1,\"delta\":{\"type\":\"input_json_delta\",\"partial_json\":\"\\\"Rome\\\"}\"}}\n\n"+
+		"data: {\"type\":\"content_block_stop\",\"index\":1}\n\n"+
+		"data: {\"type\":\"message_delta\",\"delta\":{\"stop_reason\":\"tool_use\"},\"usage\":{\"output_tokens\":7}}\n\n"+
+		"data: {\"type\":\"message_stop\"}\n\n", &got, &hdr, &path)
+	defer srv.Close()
+
+	p, _ := New(Config{Name: "anthropic", Wire: WireAnthropic, BaseURL: srv.URL, Model: "m"})
+	s, err := p.Stream(context.Background(), Request{Messages: []Message{UserText("hi")}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	text, calls, done := drain(t, s)
+	if got["stream"] != true {
+		t.Errorf("stream flag not sent: %v", got)
+	}
+	if text != "Hello" || len(calls) != 1 || string(calls[0].Input) != `{"city":"Rome"}` {
+		t.Errorf("text=%q calls=%+v", text, calls)
+	}
+	if done == nil || done.Text() != "Hello" || done.StopReason != StopToolUse || len(done.ToolCalls()) != 1 {
+		t.Fatalf("done = %+v", done)
+	}
+	if done.Usage.InputTokens != 10 || done.Usage.OutputTokens != 7 {
+		t.Errorf("usage = %+v", done.Usage)
+	}
+}
+
+func TestOpenAIStream(t *testing.T) {
+	var got map[string]any
+	var hdr http.Header
+	var path string
+	srv := serve(t, "data: {\"choices\":[{\"delta\":{\"content\":\"Hel\"}}]}\n\n"+
+		"data: {\"choices\":[{\"delta\":{\"content\":\"lo\"}}]}\n\n"+
+		"data: {\"choices\":[{\"delta\":{\"tool_calls\":[{\"index\":0,\"id\":\"c9\",\"function\":{\"name\":\"weather\",\"arguments\":\"{\\\"city\\\":\"}}]}}]}\n\n"+
+		"data: {\"choices\":[{\"delta\":{\"tool_calls\":[{\"index\":0,\"function\":{\"arguments\":\"\\\"Rome\\\"}\"}}]}}]}\n\n"+
+		"data: {\"choices\":[{\"delta\":{},\"finish_reason\":\"tool_calls\"}]}\n\n"+
+		"data: {\"choices\":[],\"usage\":{\"prompt_tokens\":10,\"completion_tokens\":7}}\n\n"+
+		"data: [DONE]\n\n", &got, &hdr, &path)
+	defer srv.Close()
+
+	p, _ := New(Config{Name: "ollama", Wire: WireOpenAI, BaseURL: srv.URL, Model: "m"})
+	s, err := p.Stream(context.Background(), Request{Messages: []Message{UserText("hi")}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	text, calls, done := drain(t, s)
+	if got["stream"] != true || got["stream_options"] == nil {
+		t.Errorf("stream flags not sent: %v", got)
+	}
+	if text != "Hello" || len(calls) != 1 || calls[0].ID != "c9" || string(calls[0].Input) != `{"city":"Rome"}` {
+		t.Errorf("text=%q calls=%+v", text, calls)
+	}
+	if done == nil || done.Text() != "Hello" || done.StopReason != StopToolUse || len(done.ToolCalls()) != 1 {
+		t.Fatalf("done = %+v", done)
+	}
+	if done.Usage.InputTokens != 10 || done.Usage.OutputTokens != 7 {
+		t.Errorf("usage = %+v", done.Usage)
+	}
+}

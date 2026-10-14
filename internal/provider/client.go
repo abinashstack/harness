@@ -59,8 +59,9 @@ func (c httpClient) apiKey() (string, error) {
 	return k, nil
 }
 
-// post sends body as JSON and returns the response body for any 2xx status.
-func (c httpClient) post(ctx context.Context, url string, headers map[string]string, body any) ([]byte, error) {
+// open sends body as JSON and returns the response for any 2xx status. The
+// caller closes resp.Body.
+func (c httpClient) open(ctx context.Context, url string, headers map[string]string, body any) (*http.Response, error) {
 	b, err := json.Marshal(body)
 	if err != nil {
 		return nil, err
@@ -80,28 +81,26 @@ func (c httpClient) post(ctx context.Context, url string, headers map[string]str
 	if err != nil {
 		return nil, err
 	}
-	defer resp.Body.Close()
-	data, err := io.ReadAll(resp.Body)
-	if err != nil {
-		return nil, err
-	}
 	if resp.StatusCode/100 != 2 {
+		defer resp.Body.Close()
+		data, _ := io.ReadAll(io.LimitReader(resp.Body, 501))
 		msg := string(data)
 		if len(msg) > 500 {
 			msg = msg[:500] + "..."
 		}
 		return nil, fmt.Errorf("provider %q: HTTP %d: %s", c.cfg.Name, resp.StatusCode, msg)
 	}
-	return data, nil
+	return resp, nil
 }
 
-// streamViaChat satisfies Provider.Stream for adapters that only implement Chat.
-func streamViaChat(ctx context.Context, p Provider, req Request) (Stream, error) {
-	resp, err := p.Chat(ctx, req)
+// post is open plus reading the whole response body.
+func (c httpClient) post(ctx context.Context, url string, headers map[string]string, body any) ([]byte, error) {
+	resp, err := c.open(ctx, url, headers, body)
 	if err != nil {
 		return nil, err
 	}
-	return DefaultStream(resp), nil
+	defer resp.Body.Close()
+	return io.ReadAll(resp.Body)
 }
 
 // objectOrEmpty returns raw, or "{}" when raw is empty, for tool-call arguments.

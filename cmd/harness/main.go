@@ -57,7 +57,7 @@ func run() error {
 	if err != nil {
 		return err
 	}
-	resp, err := p.Chat(context.Background(), provider.Request{
+	s, err := p.Stream(context.Background(), provider.Request{
 		System:    *system,
 		Messages:  []provider.Message{provider.UserText(prompt)},
 		MaxTokens: *maxTokens,
@@ -65,9 +65,21 @@ func run() error {
 	if err != nil {
 		return err
 	}
-	fmt.Println(resp.Text())
-	fmt.Fprintf(os.Stderr, "[%s, %s, %d in / %d out tokens]\n", p.Name(), resp.StopReason, resp.Usage.InputTokens, resp.Usage.OutputTokens)
-	return nil
+	defer s.Close()
+	for {
+		c, err := s.Recv()
+		if err == io.EOF {
+			return nil
+		}
+		if err != nil {
+			return err
+		}
+		fmt.Print(c.TextDelta)
+		if r := c.Done; r != nil {
+			fmt.Println()
+			fmt.Fprintf(os.Stderr, "[%s, %s, %d in / %d out tokens]\n", p.Name(), r.StopReason, r.Usage.InputTokens, r.Usage.OutputTokens)
+		}
+	}
 }
 
 func presetConfig(name string) (provider.Config, error) {
